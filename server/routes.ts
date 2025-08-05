@@ -2,6 +2,9 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { WebSocketServer } from 'ws';
 import { storage } from "./storage";
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import { User } from '@shared/schema';
 import { pool } from "./db";
 import { db } from "./db";
 import { sql } from "drizzle-orm";
@@ -9116,6 +9119,149 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     }
   });
+
+  // Android login endpoint - handles both email/password and Google login
+  app.post("/api/auth/android-login", async (req: any, res: any) => {
+    try {
+      const { email, password, googleId, name, photoUrl } = req.body;
+      let user;
+      
+      // Input validation
+      if (!email) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Email is required' 
+        });
+      }
+
+      // Google login flow
+      if (googleId) {
+        // Check if user exists with this Google ID
+        user = await storage.getUserByEmail(email);
+        
+        // If user doesn't exist, create a new one
+        if (!user) {
+          // Generate a random password for the user (won't be used for Google login)
+          const randomPassword = Math.random().toString(36).slice(-8);
+          const hashedPassword = await bcrypt.hash(randomPassword, 10);
+          
+          // Create new user
+          user = await storage.createUser({
+            email,
+            name: name || email.split('@')[0],
+            password: hashedPassword,
+            googleId,
+            photoUrl: photoUrl || null,
+            emailVerified: true,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+          
+          console.log(`Created new user via Google login: ${user.id}`);
+        } else if (user.googleId !== googleId) {
+          // If user exists but Google ID doesn't match, it might be a security issue
+          return res.status(401).json({
+            success: false,
+            message: 'This email is already registered with a different account'
+          });
+        }
+        
+        // Update last login time and photo URL if provided
+        await storage.updateUser(user.id, { 
+          lastLoginAt: new Date(),
+          photoUrl: photoUrl || user.photoUrl
+        });
+        
+      } else {
+        // Email/password login flow
+        if (!password) {
+          return res.status(400).json({ 
+            success: false, 
+            message: 'Password is required for email login' 
+          });
+        }
+        
+        // Find user by email
+        user = await storage.getUserByEmail(email);
+        
+        if (!user) {
+          return res.status(401).json({ 
+            success: false, 
+            message: 'Invalid email or password' 
+          });
+        }
+        
+        // Verify password
+        try {
+          let isPasswordValid = false;
+          
+          // Try bcrypt first if available
+          if (user.password.startsWith('$2b$') || user.password.startsWith('$2a$')) {
+            isPasswordValid = await bcrypt.compare(password, user.password);
+          } else {
+            // Fallback to direct comparison (not recommended for production)
+            isPasswordValid = user.password === password;
+            
+            // If password matches but is not hashed, update it to be hashed
+            if (isPasswordValid) {
+              const hashedPassword = await bcrypt.hash(password, 10);
+              await storage.updateUser(user.id, { password: hashedPassword });
+              console.log(`Updated password hash for user ${user.id}`);
+            }
+          }
+          
+          if (!isPasswordValid) {
+            return res.status(401).json({ 
+              success: false, 
+              message: 'Invalid email or password' 
+            });
+          }
+          
+          // Update last login time for email/password login
+          await storage.updateUser(user.id, { lastLoginAt: new Date() });
+          
+        } catch (error: any) {
+          console.error('Password verification error:', error);
+          return res.status(500).json({
+            success: false,
+            message: 'Error during authentication',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+          });
+        }
+      }
+
+      // Generate JWT token (same for both login methods)
+      const token = jwt.sign(
+        { 
+          userId: user.id, 
+          email: user.email,
+          isGoogleAuth: !!googleId
+        },
+        process.env.JWT_SECRET || 'your-secret-key',
+        { expiresIn: '7d' }
+      );
+
+      // Return user data (exclude sensitive information)
+      const { password: _, ...userData } = user;
+      
+      res.json({
+        success: true,
+        message: googleId ? 'Google login successful' : 'Login successful',
+        user: userData,
+        token: token,
+        expiresIn: 7 * 24 * 60 * 60 // 7 days in seconds
+      });
+      
+    } catch (error) {
+      console.error('Android login error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: 'An error occurred during login',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    }
+  });
+
 
   const httpServer = createServer(app);
 
